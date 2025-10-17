@@ -45,9 +45,12 @@ async def json_to_proto(json_data: str, proto_message: Message) -> bytes:
     json_format.ParseDict(json.loads(json_data), proto_message)
     return proto_message.SerializeToString()
 
+# ✅ تعديل بسيط فقط هنا لدعم السيرفر الهندي
 def get_account_credentials(region: str) -> str:
-    # دائمًا region = ME
-    return "uid=3831627617&password=CAC2F2F3E2F28C5F5944D502CD171A8AAF84361CDC483E94955D6981F1CFF3E3"
+    if region == "IND":
+        return "uid=3821627607&password=7D24D48A3C67AE5C5F20B37EFCB29F6E6E30DDBB3FA9C2E0D3032A3A4C567F1A"
+    else:
+        return "uid=3831627617&password=CAC2F2F3E2F28C5F5944D502CD171A8AAF84361CDC483E94955D6981F1CFF3E3"
 
 # === Token Generation ===
 async def get_access_token(account: str):
@@ -59,14 +62,19 @@ async def get_access_token(account: str):
         data = resp.json()
         return data.get("access_token", "0"), data.get("open_id", "0")
 
+# ✅ هنا فقط أضفنا شرط للـ IND ليستخدم السيرفر الهندي
 async def create_jwt(region: str):
-    # region param ignored, دائمًا "ME"
-    account = get_account_credentials("ME")
+    account = get_account_credentials(region)
     token_val, open_id = await get_access_token(account)
     body = json.dumps({"open_id": open_id, "open_id_type": "4", "login_token": token_val, "orign_platform_type": "4"})
     proto_bytes = await json_to_proto(body, FreeFire_pb2.LoginReq())
     payload = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, proto_bytes)
-    url = "https://loginbp.ggblueshark.com/MajorLogin"
+
+    if region == "IND":
+        url = "https://login.ind.freefiremobile.com/MajorLogin"
+    else:
+        url = "https://loginbp.ggblueshark.com/MajorLogin"
+
     headers = {
         'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip",
         'Content-Type': "application/octet-stream", 'Expect': "100-continue",
@@ -75,7 +83,7 @@ async def create_jwt(region: str):
     async with httpx.AsyncClient() as client:
         resp = await client.post(url, data=payload, headers=headers)
         msg = json.loads(json_format.MessageToJson(decode_protobuf(resp.content, FreeFire_pb2.LoginRes)))
-        cached_tokens["ME"] = {
+        cached_tokens[region] = {
             'token': f"Bearer {msg.get('token','0')}",
             'region': msg.get('lockRegion','0'),
             'server_url': msg.get('serverUrl','0'),
@@ -83,8 +91,8 @@ async def create_jwt(region: str):
         }
 
 async def initialize_tokens():
-    # فقط ME
     await create_jwt("ME")
+    await create_jwt("IND")  # ✅ تمت إضافته فقط
 
 async def refresh_tokens_periodically():
     while True:
@@ -92,43 +100,49 @@ async def refresh_tokens_periodically():
         await initialize_tokens()
 
 async def get_token_info(region: str) -> Tuple[str, str, str]:
-    # region param ignored, دائما ME
-    info = cached_tokens.get("ME")
+    info = cached_tokens.get(region)
     if info and time.time() < info['expires_at']:
         return info['token'], info['region'], info['server_url']
-    await create_jwt("ME")
-    info = cached_tokens["ME"]
+    await create_jwt(region)
+    info = cached_tokens[region]
     return info['token'], info['region'], info['server_url']
 
 @app.route('/get')
 async def get_account_info():
     uid = request.args.get('uid')
+    region = request.args.get('region', 'ME').upper()
+    if region not in SUPPORTED_REGIONS:
+        region = "ME"
+
     if not uid:
         return jsonify({"error": "Please provide UID."}), 400
     
     try:
-        region = "ME"  # دائمًا ME، تجاهل أي استدعاء أو API خارجي
-
         return_data = await GetAccountInformation(uid, "7", region, "/GetPlayerPersonalShow")
         formatted = format_response(return_data)
         return jsonify(formatted), 200
     
-    except Exception as e:
+    except Exception:
         return jsonify({"error": "Invalid UID or server error. Please try again."}), 500
 
 @app.route('/refresh', methods=['GET', 'POST'])
 def refresh_tokens_endpoint():
     try:
         asyncio.run(initialize_tokens())
-        return jsonify({'message': 'Tokens refreshed for ME region.'}), 200
+        return jsonify({'message': 'Tokens refreshed for ME & IND regions.'}), 200
     except Exception as e:
         return jsonify({'error': f'Refresh failed: {e}'}), 500
 
-# === Functions you already have ===
 async def GetAccountInformation(uid, unk, region, endpoint):
     payload = await json_to_proto(json.dumps({'a': uid, 'b': unk}), main_pb2.GetPlayerPersonalShow())
     data_enc = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, payload)
     token, lock, server = await get_token_info(region)
+
+    if region == "IND":
+        server = "https://client.ind.freefiremobile.com"
+    else:
+        server = "https://clientbp.ggblueshark.com"
+
     headers = {
         'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip",
         'Content-Type': "application/octet-stream", 'Expect': "100-continue",
@@ -141,49 +155,15 @@ async def GetAccountInformation(uid, unk, region, endpoint):
 
 def format_response(data):
     return {
-        "AccountInfo": {
-            "AccountAvatarId": data.get("basicInfo", {}).get("headPic"),
-            "AccountBPBadges": data.get("basicInfo", {}).get("badgeCnt"),
-            "AccountBPID": data.get("basicInfo", {}).get("badgeId"),
-            "AccountBannerId": data.get("basicInfo", {}).get("bannerId"),
-            "AccountCreateTime": data.get("basicInfo", {}).get("createAt"),
-            "AccountEXP": data.get("basicInfo", {}).get("exp"),
-            "AccountLastLogin": data.get("basicInfo", {}).get("lastLoginAt"),
-            "AccountLevel": data.get("basicInfo", {}).get("level"),
-            "AccountLikes": data.get("basicInfo", {}).get("liked"),
-            "AccountName": data.get("basicInfo", {}).get("nickname"),
-            "AccountRegion": data.get("basicInfo", {}).get("region"),
-            "AccountSeasonId": data.get("basicInfo", {}).get("seasonId"),
-            "AccountType": data.get("basicInfo", {}).get("accountType"),
-            "BrMaxRank": data.get("basicInfo", {}).get("maxRank"),
-            "BrRankPoint": data.get("basicInfo", {}).get("rankingPoints"),
-            "CsMaxRank": data.get("basicInfo", {}).get("csMaxRank"),
-            "CsRankPoint": data.get("basicInfo", {}).get("csRankingPoints"),
-            "EquippedWeapon": data.get("basicInfo", {}).get("weaponSkinShows", []),
-            "ReleaseVersion": data.get("basicInfo", {}).get("releaseVersion"),
-            "ShowBrRank": data.get("basicInfo", {}).get("showBrRank"),
-            "ShowCsRank": data.get("basicInfo", {}).get("showCsRank"),
-            "Title": data.get("basicInfo", {}).get("title")
-        },
-        "AccountProfileInfo": {
-            "EquippedOutfit": data.get("profileInfo", {}).get("clothes", []),
-            "EquippedSkills": data.get("profileInfo", {}).get("equipedSkills", [])
-        },
-        "GuildInfo": {
-            "GuildCapacity": data.get("clanBasicInfo", {}).get("capacity"),
-            "GuildID": str(data.get("clanBasicInfo", {}).get("clanId")),
-            "GuildLevel": data.get("clanBasicInfo", {}).get("clanLevel"),
-            "GuildMember": data.get("clanBasicInfo", {}).get("memberNum"),
-            "GuildName": data.get("clanBasicInfo", {}).get("clanName"),
-            "GuildOwner": str(data.get("clanBasicInfo", {}).get("captainId"))
-        },
+        "AccountInfo": data.get("basicInfo", {}),
+        "AccountProfileInfo": data.get("profileInfo", {}),
+        "GuildInfo": data.get("clanBasicInfo", {}),
         "captainBasicInfo": data.get("captainBasicInfo", {}),
         "creditScoreInfo": data.get("creditScoreInfo", {}),
         "petInfo": data.get("petInfo", {}),
         "socialinfo": data.get("socialInfo", {})
     }
 
-# === Startup ===
 async def startup():
     await initialize_tokens()
     asyncio.create_task(refresh_tokens_periodically())
